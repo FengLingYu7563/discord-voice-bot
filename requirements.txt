@@ -1,0 +1,8 @@
+PyNaCl
+python-dotenv==1.2.2
+edge-tts==7.2.8
+imageio-ffmpeg==0.6.0
+faster-whisper==1.2.1
+davey==0.1.5
+google-genai
+

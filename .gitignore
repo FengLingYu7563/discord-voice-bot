@@ -1,0 +1,32 @@
+# === 密鑰 / 個人設定（絕不上傳）===
+.env
+
+# === 個人專案筆記（含敏感資訊：來源連結、voice clone 細節）===
+CLAUDE.md
+
+# === 聲音檔案（參考音、訓練素材、樣本，含真人聲音）===
+refs/
+training/
+*.wav
+*.mp3
+
+# === Python ===
+__pycache__/
+*.pyc
+venv/
+
+# === log / 測試垃圾 ===
+*.log
+test_*.txt
+test_*.py
+
+# === 啟動腳本（含本機絕對路徑、機器專屬）===
+*.bat
+
+# === Claude Code 本機資料（如不想公開 skill / 設定）===
+# 若想分享 skill 可把下面這行註解掉
+.claude/
+
+# === Docker（本專案沒在用，如不需要可一併忽略）===
+# Dockerfile
+# docker-compose.yml
