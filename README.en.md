@@ -17,6 +17,7 @@ You speak -> STT -> LLM generates a reply -> TTS synthesizes speech -> bot speak
   - `edge-tts`: cloud, free, good quality, fast (~1s)
   - `GPT-SoVITS`: local, voice cloning from reference audio (~5s)
 - VAD-based dynamic segmentation: stops recording once you finish speaking; short utterances respond in ~2s
+- Triple noise defense: VAD silence filtering + Whisper built-in VAD + hallucination blocklist, with an option to respond only to the initiator
 
 ## Requirements
 

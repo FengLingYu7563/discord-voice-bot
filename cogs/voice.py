@@ -1,6 +1,7 @@
 import io
 import time
 import wave
+import warnings
 import discord
 import numpy as np
 from discord.ext import commands
@@ -13,6 +14,13 @@ import imageio_ffmpeg
 from faster_whisper import WhisperModel
 from google import genai
 from google.genai import types as gtypes
+
+# fork 寫死的過時警告：我們已修好 DAVE 解密，這警告誤導又洗版，過濾掉
+warnings.filterwarnings(
+    "ignore",
+    message=".*Voice reception is currently broken.*",
+    category=RuntimeWarning,
+)
 
 
 # VAD 音量門檻：16-bit PCM 峰值，超過視為有聲，否則當靜音
@@ -49,22 +57,22 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 # TTS backend: "edge" (cloud, 預設) 或 "gptsovits" (本地 voice clone)
 TTS_BACKEND = os.getenv("TTS_BACKEND", "edge").lower()
 GPTSOVITS_URL = os.getenv("GPTSOVITS_URL", "http://127.0.0.1:9880/tts")
-# 融合音色設定（A、B 各半、無 C、咬字鬆 temp 1.1）
+# 融合音色設定（A 為主、咬字鬆 temp 1.1）
 # 路徑相對於專案根目錄，不寫死本機絕對路徑（可攜 + 不洩漏目錄結構）
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _FUSION = os.path.join(_PROJECT_ROOT, "refs", "fusion")
 GPTSOVITS_REF_AUDIO = os.getenv(
-    "GPTSOVITS_REF_AUDIO", os.path.join(_FUSION, "aux_b2.wav")
+    "GPTSOVITS_REF_AUDIO", os.path.join(_FUSION, "aux_a1.wav")
 )
 GPTSOVITS_REF_TEXT = os.getenv(
     "GPTSOVITS_REF_TEXT",
-    "双排那个我也觉得那个双排那个有点上面那个。",
+    "好久没有早起东西了，一喜欢还是被叫醒？",
 )
-# 主 B2 + aux 3 段 = 共 2B 2A（無 C）
+# 主 A1 + aux 3 段 = 共 2A 2B（A 為主）
 GPTSOVITS_AUX_AUDIO = [
-    os.path.join(_FUSION, "aux_b1.wav"),   # B
-    os.path.join(_FUSION, "aux_a1.wav"),   # A
     os.path.join(_FUSION, "aux_a2.wav"),   # A
+    os.path.join(_FUSION, "aux_b1.wav"),   # B
+    os.path.join(_FUSION, "aux_b2.wav"),   # B
 ]
 # VAD 參數
 MIN_RECORD = 1.0         # 最短錄音秒數
@@ -73,7 +81,7 @@ SILENCE_END = 1.2        # 偵測到語音後沉默多久就停錄
 POLL_INTERVAL = 0.15     # 偵測週期
 MIN_PCM_BYTES = 48000 * 2 * 2  # 1 秒 48kHz 立體聲 16-bit
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 SYSTEM_PROMPT = (
     "你是『楓小語』，一個在 Discord 語音頻道陪人聊天的台灣女生。"
     "個性：聰明、有點皮、講話直接但不毒舌，喜歡反問、喜歡開玩笑，但不會油。"
@@ -88,7 +96,7 @@ SYSTEM_PROMPT = (
 )
 
 print("Loading Whisper model...")
-_whisper = WhisperModel("small", device="cpu", compute_type="int8")
+_whisper = WhisperModel("medium", device="cpu", compute_type="int8")
 print("Whisper model ready.")
 
 _genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -141,9 +149,33 @@ def _gemini_reply(history: list[gtypes.Content], user_text: str) -> str:
     return reply
 
 
+# Whisper 對著靜音/雜音常腦補出的字幕掛名幻覺，整段命中就丟棄
+_HALLUCINATION_BLOCKLIST = (
+    "字幕by", "字幕志愿者", "中文字幕", "请不吝点赞", "点赞订阅", "订阅转发",
+    "謝謝觀看", "谢谢观看", "感謝觀看", "感谢观看", "下次再見", "下次再见",
+    "明鏡與點點欄目", "明镜与点点栏目", "索兰娅", "索蘭婭",
+)
+
+
+def _is_hallucination(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return True
+    return any(bad in t for bad in _HALLUCINATION_BLOCKLIST)
+
+
 def _transcribe(path: str) -> str:
-    segments, _ = _whisper.transcribe(path, language="zh")
-    return "".join(s.text for s in segments).strip()
+    # vad_filter：轉錄前用 Silero VAD 濾掉非人聲段，大幅減少對靜音/雜音的幻覺
+    segments, _ = _whisper.transcribe(
+        path,
+        language="zh",
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
+    )
+    text = "".join(s.text for s in segments).strip()
+    if _is_hallucination(text):
+        return ""
+    return text
 
 
 def _pcm_to_wav(pcm_data: bytes) -> bytes:
@@ -205,11 +237,17 @@ async def speak(vc, text: str):
     os.remove(tmp)
 
 
+# True：只回應發起 /join 的人，忽略頻道內其他人（避免別人麥克風雜音/幻覺一直觸發）
+# False：頻道內每個講話的人都會回應
+RESPOND_ONLY_TO_INITIATOR = True
+
+
 class VoiceCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.sessions: dict[int, bool] = {}
         self.histories: dict[int, list[gtypes.Content]] = {}
+        self.initiators: dict[int, int] = {}  # guild_id -> 發起 /join 的 user id
 
     @discord.slash_command(name="join", description="讓機器人加入你目前的語音頻道")
     async def join(self, ctx: discord.ApplicationContext):
@@ -242,6 +280,7 @@ class VoiceCog(commands.Cog):
         print(f"[INFO] 已加入頻道：{channel.name}", flush=True)
         await ctx.followup.send(f"已加入 {channel.name}")
         self.sessions[ctx.guild_id] = True
+        self.initiators[ctx.guild_id] = ctx.author.id
         asyncio.create_task(self._listen_loop(vc, ctx))
 
     @discord.slash_command(name="leave", description="讓機器人離開語音頻道")
@@ -252,6 +291,7 @@ class VoiceCog(commands.Cog):
             return
         self.sessions[ctx.guild_id] = False
         self.histories.pop(ctx.guild_id, None)
+        self.initiators.pop(ctx.guild_id, None)
         await vc.disconnect()
         await ctx.respond("已離開語音頻道。")
 
@@ -317,9 +357,15 @@ class VoiceCog(commands.Cog):
                 vc.stop_recording()
                 await done.wait()
 
+                initiator = self.initiators.get(guild_id)
                 for uid, entry in results.items():
                     if not vc.is_connected():
                         break
+
+                    # 只回應發起 /join 的人，忽略頻道內其他人
+                    if RESPOND_ONLY_TO_INITIATOR and initiator and uid != initiator:
+                        print(f"[INFO] 略過非發起人 uid={uid}", flush=True)
+                        continue
 
                     pcm_data = entry["data"]
                     user = entry["user"]
